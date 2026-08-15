@@ -349,6 +349,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>
       Relatórios
     </button>
+    <button class="tab" data-tab="dados">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16"/></svg>
+      Dados
+    </button>
   </nav>
 
 </div>
@@ -385,6 +389,64 @@ let reportPeriod = 'semana';
 let customFrom = null, customTo = null;
 let liveTimerHandle = null;
 
+// turno manual (adicionar/editar turno anterior)
+let manualShiftOpen = false;
+let manualShiftEditId = null;
+let manualShiftCarId = null;
+let manualShiftPrefill = null;
+
+// abastecimento em edição
+let editingRefuelId = null;
+let refuelPrefill = null;
+
+function getLastKmForCar(carId, excludeShiftId){
+  const list = state.shifts
+    .filter(s => s.carId===carId && s.id!==excludeShiftId)
+    .sort((a,b) => (a.data+a.horaFim).localeCompare(b.data+b.horaFim));
+  return list.length ? list[list.length-1].kmFim : null;
+}
+
+// Calcula custo médio (€/km) e consumo médio (L/100km) de um carro,
+// a partir do histórico de abastecimentos (ordenados por km, método "cheio a cheio").
+function computeCarFuelStats(carId){
+  const list = state.refuels.filter(r=>r.carId===carId).sort((a,b)=>a.km-b.km);
+  if(list.length < 2) return null;
+  let totalKm=0, totalLitros=0, totalValor=0;
+  for(let i=1;i<list.length;i++){
+    const dKm = list[i].km - list[i-1].km;
+    if(dKm <= 0) continue; // ignora km inconsistentes (ex: abastecimentos fora de ordem)
+    totalKm += dKm;
+    totalLitros += list[i].litros;
+    totalValor += list[i].valor;
+  }
+  if(totalKm <= 0) return null;
+  return {
+    custoPorKm: totalValor/totalKm,
+    consumoL100: (totalLitros/totalKm)*100,
+    kmCobertos: totalKm,
+    amostras: list.length-1
+  };
+}
+
+function renderFuelEstimateBlock(carId, estId){
+  const stats = computeCarFuelStats(carId);
+  if(!stats){
+    return `<div class="lr-sub" style="margin-top:10px;">Regista pelo menos 2 abastecimentos deste carro (podem ter datas retroativas) para veres aqui a estimativa de consumo e custo por km.</div>`;
+  }
+  return `
+    <div class="odometer" style="margin-top:14px;">
+      <div class="odo-cell"><div class="odo-val" style="font-size:15px;">${eur(stats.custoPorKm)}</div><div class="odo-label">custo médio / km</div></div>
+      <div class="odo-cell"><div class="odo-val" style="font-size:15px;">${num(stats.consumoL100,1)} L</div><div class="odo-label">consumo / 100km</div></div>
+    </div>
+    <div class="lr-sub" style="margin-top:8px;">Baseado em ${stats.amostras} abastecimento(s) e ${num(stats.kmCobertos,0)} km deste carro.</div>
+    <div class="live" style="margin-top:12px; background:rgba(242,169,59,0.08); border-color:var(--line-amber-dim);">
+      <div class="live-dot" style="background:var(--line-amber);"></div>
+      <div class="live-text" style="color:var(--line-amber);">COMBUSTÍVEL ESTIMADO NESTE TURNO</div>
+      <div class="live-time" id="${estId}" style="color:var(--line-amber);">—</div>
+    </div>
+  `;
+}
+
 // ---------- Date helpers ----------
 function parseDate(iso){ const [y,m,d]=iso.split('-').map(Number); return new Date(y,m-1,d); }
 function toISO(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
@@ -406,13 +468,38 @@ function inRange(iso, from, to){
   return d >= from && d <= new Date(to.getFullYear(),to.getMonth(),to.getDate(),23,59,59);
 }
 
+function updateShiftFuelEstimate(){
+  const kmFimEl = document.getElementById('kmFim');
+  const estEl = document.getElementById('estFuelCost');
+  if(!kmFimEl || !estEl || !state.active) return;
+  const kmFim = parseFloat(kmFimEl.value);
+  if(isNaN(kmFim) || kmFim < state.active.kmInicio){ estEl.textContent = '—'; return; }
+  const stats = computeCarFuelStats(state.active.carId);
+  if(!stats){ estEl.textContent = '—'; return; }
+  estEl.textContent = eur((kmFim - state.active.kmInicio) * stats.custoPorKm);
+}
+
+function updateManualFuelEstimate(){
+  const kmInEl = document.getElementById('mKmInicio');
+  const kmFimEl = document.getElementById('mKmFim');
+  const estEl = document.getElementById('mEstFuelCost');
+  if(!kmInEl || !kmFimEl || !estEl) return;
+  const kmIn = parseFloat(kmInEl.value);
+  const kmFim = parseFloat(kmFimEl.value);
+  if(isNaN(kmIn) || isNaN(kmFim) || kmFim < kmIn){ estEl.textContent = '—'; return; }
+  const stats = computeCarFuelStats(manualShiftCarId);
+  if(!stats){ estEl.textContent = '—'; return; }
+  estEl.textContent = eur((kmFim - kmIn) * stats.custoPorKm);
+}
+
 // ---------- Render root ----------
 function render(){
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active', b.dataset.tab===activeTab));
   const main = document.getElementById('main');
   if(activeTab==='turno') main.innerHTML = renderTurno();
   else if(activeTab==='carros') main.innerHTML = renderCarros();
-  else main.innerHTML = renderRelatorios();
+  else if(activeTab==='relatorios') main.innerHTML = renderRelatorios();
+  else main.innerHTML = renderDados();
 
   const chip = document.getElementById('activeCarChip');
   if(state.active){
@@ -448,21 +535,25 @@ function renderTurno(){
     return `<div class="empty">Ainda não tens nenhum carro cadastrado.<br><br>Vai a <strong>Carros</strong> e adiciona o primeiro antes de iniciar um turno.</div>`;
   }
 
+  let top = '';
+
   if(!state.active){
     if(selectedCarForStart===null) selectedCarForStart = state.cars[0].id;
+    const defaultKm = getLastKmForCar(selectedCarForStart, null);
     const carChips = state.cars.map(c=>`
       <div class="chip-btn ${c.id===selectedCarForStart?'sel':''}" data-pick-car="${c.id}">
         ${c.apelido || c.matricula}
         <span class="sub">${c.matricula} · ${FUEL_LABEL[c.tipo]}</span>
       </div>`).join('');
 
-    return `
+    top = `
       <div class="section-title">Iniciar turno</div>
       <div class="card">
         <label>Qual carro vais usar?</label>
         <div class="chips">${carChips}</div>
         <label>Km de início</label>
-        <input type="number" inputmode="decimal" id="kmInicio" placeholder="ex: 84210">
+        <input type="number" inputmode="decimal" id="kmInicio" placeholder="ex: 84210" value="${defaultKm!=null?defaultKm:''}">
+        ${defaultKm!=null ? `<div class="lr-sub" style="margin-top:4px;">Preenchido com o km final do último turno deste carro — podes alterar.</div>` : ''}
         <div class="row2">
           <div>
             <label>Data</label>
@@ -475,49 +566,89 @@ function renderTurno(){
         </div>
         <button class="primary" id="btnStart">Iniciar turno</button>
       </div>
-      ${renderTodayShifts()}
+    `;
+  } else {
+    const car = state.cars.find(c=>c.id===state.active.carId);
+    top = `
+      <div class="live">
+        <div class="live-dot"></div>
+        <div class="live-text">EM TURNO · ${car ? (car.apelido||car.matricula) : ''}</div>
+        <div class="live-time" id="liveTime">00:00:00</div>
+      </div>
+      <div class="section-title">Terminar turno</div>
+      <div class="card">
+        <div class="odometer">
+          <div class="odo-cell"><div class="odo-val">${state.active.kmInicio}</div><div class="odo-label">km início</div></div>
+          <div class="odo-cell"><div class="odo-val">${state.active.horaInicio}</div><div class="odo-label">hora início</div></div>
+        </div>
+        <label>Km de fim</label>
+        <input type="number" inputmode="decimal" id="kmFim" placeholder="ex: 84350" oninput="updateShiftFuelEstimate()">
+        ${renderFuelEstimateBlock(state.active.carId, 'estFuelCost')}
+        <label>Hora de fim</label>
+        <input type="time" id="horaFim" value="${nowHHMM()}">
+        <div class="row2">
+          <div>
+            <label>Ganho Uber Eats (€)</label>
+            <input type="number" inputmode="decimal" id="valorUber" placeholder="0,00">
+          </div>
+          <div>
+            <label>Ganho Glovo (€)</label>
+            <input type="number" inputmode="decimal" id="valorGlovo" placeholder="0,00">
+          </div>
+        </div>
+        <button class="primary stop" id="btnStop">Terminar turno</button>
+        <button class="secondary" id="btnCancel">Cancelar turno (não guardar)</button>
+      </div>
     `;
   }
 
-  // turno ativo
-  const car = state.cars.find(c=>c.id===state.active.carId);
+  return top + renderManualShiftForm() + renderAllShifts();
+}
+
+function renderManualShiftForm(){
+  if(!manualShiftOpen){
+    return `<button class="secondary" data-open-manual="1">+ Adicionar / lançar turno anterior</button>`;
+  }
+  if(manualShiftCarId===null) manualShiftCarId = manualShiftPrefill ? manualShiftPrefill.carId : state.cars[0].id;
+  const p = manualShiftPrefill || {};
+  const defaultKm = p.kmInicio!=null ? p.kmInicio : getLastKmForCar(manualShiftCarId, manualShiftEditId);
+
+  const carChips = state.cars.map(c=>`
+    <div class="chip-btn ${c.id===manualShiftCarId?'sel':''}" data-pick-car-manual="${c.id}">
+      ${c.apelido || c.matricula}
+      <span class="sub">${c.matricula} · ${FUEL_LABEL[c.tipo]}</span>
+    </div>`).join('');
+
   return `
-    <div class="live">
-      <div class="live-dot"></div>
-      <div class="live-text">EM TURNO · ${car ? (car.apelido||car.matricula) : ''}</div>
-      <div class="live-time" id="liveTime">00:00:00</div>
-    </div>
-    <div class="section-title">Terminar turno</div>
+    <div class="section-title">${manualShiftEditId ? 'Editar turno' : 'Adicionar turno anterior'}</div>
     <div class="card">
-      <div class="odometer">
-        <div class="odo-cell"><div class="odo-val">${state.active.kmInicio}</div><div class="odo-label">km início</div></div>
-        <div class="odo-cell"><div class="odo-val">${state.active.horaInicio}</div><div class="odo-label">hora início</div></div>
-      </div>
-      <label>Km de fim</label>
-      <input type="number" inputmode="decimal" id="kmFim" placeholder="ex: 84350">
-      <label>Hora de fim</label>
-      <input type="time" id="horaFim" value="${nowHHMM()}">
+      <div class="lr-sub" style="margin-bottom:10px;">Usa isto para lançar ganhos de dias anteriores (antes de teres o app) ou para corrigir um turno já registado. Entra nos relatórios da data que indicares.</div>
+      <label>Carro</label>
+      <div class="chips">${carChips}</div>
       <div class="row2">
-        <div>
-          <label>Ganho Uber Eats (€)</label>
-          <input type="number" inputmode="decimal" id="valorUber" placeholder="0,00">
-        </div>
-        <div>
-          <label>Ganho Glovo (€)</label>
-          <input type="number" inputmode="decimal" id="valorGlovo" placeholder="0,00">
-        </div>
+        <div><label>Data</label><input type="date" id="mData" value="${p.data||todayISO()}"></div>
+        <div><label>Hora início</label><input type="time" id="mHoraInicio" value="${p.horaInicio||''}"></div>
       </div>
-      <button class="primary stop" id="btnStop">Terminar turno</button>
-      <button class="secondary" id="btnCancel">Cancelar turno (não guardar)</button>
+      <div class="row2">
+        <div><label>Km início</label><input type="number" inputmode="decimal" id="mKmInicio" value="${defaultKm!=null?defaultKm:''}" oninput="updateManualFuelEstimate()"></div>
+        <div><label>Hora fim</label><input type="time" id="mHoraFim" value="${p.horaFim||''}"></div>
+      </div>
+      <label>Km fim</label>
+      <input type="number" inputmode="decimal" id="mKmFim" value="${p.kmFim!=null?p.kmFim:''}" oninput="updateManualFuelEstimate()">
+      ${renderFuelEstimateBlock(manualShiftCarId, 'mEstFuelCost')}
+      <div class="row2">
+        <div><label>Ganho Uber Eats (€)</label><input type="number" inputmode="decimal" id="mValorUber" value="${p.valorUber!=null?p.valorUber:''}"></div>
+        <div><label>Ganho Glovo (€)</label><input type="number" inputmode="decimal" id="mValorGlovo" value="${p.valorGlovo!=null?p.valorGlovo:''}"></div>
+      </div>
+      <button class="primary" data-save-manual="1">${manualShiftEditId ? 'Guardar alteração' : 'Guardar turno'}</button>
+      <button class="secondary" data-cancel-manual="1">Cancelar</button>
     </div>
-    ${renderTodayShifts()}
   `;
 }
 
-function renderTodayShifts(){
-  const today = todayISO();
-  const list = state.shifts.filter(s=>s.data===today).sort((a,b)=>a.horaInicio.localeCompare(b.horaInicio));
-  if(list.length===0) return '';
+function renderAllShifts(){
+  const list = state.shifts.slice().sort((a,b)=> (b.data+b.horaInicio).localeCompare(a.data+a.horaInicio));
+  if(list.length===0) return `<div class="section-title">Turnos</div><div class="empty">Ainda não há turnos registados.</div>`;
   const rows = list.map(s=>{
     const car = state.cars.find(c=>c.id===s.carId);
     const km = s.kmFim - s.kmInicio;
@@ -525,17 +656,20 @@ function renderTodayShifts(){
     return `
       <div class="list-row">
         <div>
-          <div class="lr-main">${s.horaInicio}–${s.horaFim} · ${car?(car.apelido||car.matricula):'?'}</div>
+          <div class="lr-main">${s.data} · ${s.horaInicio}–${s.horaFim} · ${car?(car.apelido||car.matricula):'?'}</div>
           <div class="lr-sub">${km} km · Uber ${eur(s.valorUber)} · Glovo ${eur(s.valorGlovo)}</div>
         </div>
         <div style="text-align:right;">
           <div class="lr-val">${eur(total)}</div>
-          <button class="ghost-sm danger" data-del-shift="${s.id}">apagar</button>
+          <div class="lr-actions">
+            <button class="ghost-sm" data-edit-shift="${s.id}">editar</button>
+            <button class="ghost-sm danger" data-del-shift="${s.id}">apagar</button>
+          </div>
         </div>
       </div>`;
   }).join('');
   return `
-    <div class="section-title">Turnos de hoje</div>
+    <div class="section-title">Todos os turnos (${list.length})</div>
     <div class="card">${rows}</div>
   `;
 }
@@ -549,14 +683,18 @@ function renderCarros(){
         <div class="row2" style="align-items:flex-end;">
           <div><div class="lr-main" style="font-size:15px;">${c.apelido || c.matricula}</div>
           <div class="lr-sub">${c.matricula} · ${FUEL_LABEL[c.tipo]} · ${refCount} abastecimento(s)</div></div>
-          <button class="ghost-sm danger" data-del-car="${c.id}">apagar</button>
+          <div class="lr-actions">
+            <button class="ghost-sm" data-edit-car="${c.id}">editar</button>
+            <button class="ghost-sm danger" data-del-car="${c.id}">apagar</button>
+          </div>
         </div>
       </div>`;
   }).join('') || `<div class="empty">Nenhum carro cadastrado ainda.</div>`;
 
-  const carOptionsForRefuel = state.cars.map(c=>`<option value="${c.id}">${c.apelido||c.matricula} (${FUEL_LABEL[c.tipo]})</option>`).join('');
+  const carOptionsForRefuel = state.cars.map(c=>`<option value="${c.id}" ${refuelPrefill && refuelPrefill.carId===c.id?'selected':''}>${c.apelido||c.matricula} (${FUEL_LABEL[c.tipo]})</option>`).join('');
+  const rp = refuelPrefill || {};
 
-  const refuelRows = state.refuels.slice().sort((a,b)=>b.data.localeCompare(a.data)).slice(0,10).map(r=>{
+  const refuelRows = state.refuels.slice().sort((a,b)=> (b.data).localeCompare(a.data)).map(r=>{
     const car = state.cars.find(c=>c.id===r.carId);
     return `
       <div class="list-row">
@@ -566,7 +704,10 @@ function renderCarros(){
         </div>
         <div style="text-align:right;">
           <div class="lr-val">${eur(r.valor)}</div>
-          <button class="ghost-sm danger" data-del-refuel="${r.id}">apagar</button>
+          <div class="lr-actions">
+            <button class="ghost-sm" data-edit-refuel="${r.id}">editar</button>
+            <button class="ghost-sm danger" data-del-refuel="${r.id}">apagar</button>
+          </div>
         </div>
       </div>`;
   }).join('');
@@ -578,28 +719,28 @@ function renderCarros(){
 
     <hr class="divider-road">
 
-    <div class="section-title">Registar abastecimento</div>
+    <div class="section-title">${editingRefuelId ? 'Editar abastecimento' : 'Registar abastecimento'}</div>
     <div class="card">
       <label>Carro</label>
       <select id="refCar">${carOptionsForRefuel}</select>
       <div class="row2">
-        <div><label>Data</label><input type="date" id="refData" value="${todayISO()}"></div>
-        <div><label>Km no abastecimento</label><input type="number" inputmode="decimal" id="refKm" placeholder="ex: 84300"></div>
+        <div><label>Data</label><input type="date" id="refData" value="${rp.data||todayISO()}"></div>
+        <div><label>Km no abastecimento</label><input type="number" inputmode="decimal" id="refKm" placeholder="ex: 84300" value="${rp.km!=null?rp.km:''}"></div>
       </div>
       <div class="row2">
-        <div><label>Litros</label><input type="number" inputmode="decimal" id="refLitros" placeholder="ex: 40"></div>
-        <div><label>Valor pago (€)</label><input type="number" inputmode="decimal" id="refValor" placeholder="ex: 62,00"></div>
+        <div><label>Litros</label><input type="number" inputmode="decimal" id="refLitros" placeholder="ex: 40" value="${rp.litros!=null?rp.litros:''}"></div>
+        <div><label>Valor pago (€)</label><input type="number" inputmode="decimal" id="refValor" placeholder="ex: 62,00" value="${rp.valor!=null?rp.valor:''}"></div>
       </div>
-      <button class="primary" id="btnAddRefuel" ${state.cars.length===0?'disabled':''}>Guardar abastecimento</button>
+      <button class="primary" id="btnAddRefuel" ${state.cars.length===0?'disabled':''}>${editingRefuelId ? 'Guardar alteração' : 'Guardar abastecimento'}</button>
+      ${editingRefuelId ? `<button class="secondary" id="btnCancelRefuel">Cancelar edição</button>` : ''}
     </div>
 
-    ${refuelRows ? `<div class="section-title">Últimos abastecimentos</div><div class="card">${refuelRows}</div>` : ''}
+    ${refuelRows ? `<div class="section-title">Abastecimentos (${state.refuels.length})</div><div class="card">${refuelRows}</div>` : ''}
   `;
 }
 
 // ---------- TAB: RELATÓRIOS ----------
-function renderRelatorios(){
-  const [from, to] = getPeriodRange();
+function computeStats(from, to){
   const shifts = state.shifts.filter(s=>inRange(s.data, from, to));
   const refuels = state.refuels.filter(r=>inRange(r.data, from, to));
 
@@ -634,9 +775,7 @@ function renderRelatorios(){
   const eurPorHora = horasTotais>0 ? ganhoTotal/horasTotais : 0;
 
   const plataformaTop = uberLiquido===glovoLiquido ? 'Empate' : (uberLiquido>glovoLiquido ? 'Uber Eats' : 'Glovo');
-  const maxLiquido = Math.max(uberLiquido, glovoLiquido, 1);
 
-  // por carro
   const carStats = state.cars.map(c=>{
     const cShifts = shifts.filter(s=>s.carId===c.id);
     const cRef = refuels.filter(r=>r.carId===c.id);
@@ -645,6 +784,19 @@ function renderRelatorios(){
     const cGasto = cRef.reduce((a,r)=>a+r.valor,0);
     return { car:c, ganho:cGanho, km:cKm, gasto:cGasto, turnos:cShifts.length };
   }).filter(cs=>cs.turnos>0 || cs.gasto>0);
+
+  return { nTurnos, horasTotais, kmTotais, uberBruto, glovoBruto, uberLiquido, glovoLiquido,
+    ganhoTotal, horasMedias, kmMedios, litrosTotais, combustivelGasto, porTipo, lucro,
+    pctCombustivel, eurPorKm, eurPorHora, plataformaTop, carStats };
+}
+
+function renderRelatorios(){
+  const [from, to] = getPeriodRange();
+  const st = computeStats(from, to);
+  const { nTurnos, horasTotais, kmTotais, uberLiquido, glovoLiquido, ganhoTotal, horasMedias,
+    kmMedios, litrosTotais, combustivelGasto, porTipo, lucro, pctCombustivel, eurPorHora,
+    plataformaTop, carStats } = st;
+  const maxLiquido = Math.max(uberLiquido, glovoLiquido, 1);
 
   let verdictClass='good', verdictText='';
   if(ganhoTotal<=0 && combustivelGasto<=0){
@@ -734,7 +886,115 @@ function renderRelatorios(){
     </div>` : ''}
 
     <div class="verdict ${verdictClass}">${verdictText}</div>
+
+    <button class="secondary" id="btnShareReport">Partilhar / enviar este relatório</button>
   `;
+}
+
+function buildReportText(){
+  const [from, to] = getPeriodRange();
+  const st = computeStats(from, to);
+  const periodLabel = {
+    semana:'Esta semana', semana_passada:'Semana passada', mes:'Este mês', custom:'Período personalizado'
+  }[reportPeriod];
+  const tipos = Object.entries(st.porTipo).map(([t,v])=>`  ${FUEL_LABEL[t]}: ${eur(v)}`).join('\n');
+  return [
+    `ESTRADA — Relatório de ganhos`,
+    `${periodLabel} (${toISO(from)} a ${toISO(to)})`,
+    ``,
+    `Turnos: ${st.nTurnos}`,
+    `Horas trabalhadas: ${num(st.horasTotais,1)}h (média ${num(st.horasMedias,1)}h/turno)`,
+    `Km percorridos: ${num(st.kmTotais,0)} km (média ${num(st.kmMedios,0)} km/turno)`,
+    ``,
+    `Uber Eats (líquido, -10%): ${eur(st.uberLiquido)}`,
+    `Glovo (integral): ${eur(st.glovoLiquido)}`,
+    `Ganho total líquido: ${eur(st.ganhoTotal)}`,
+    `€ por hora: ${eur(st.eurPorHora)}`,
+    `Plataforma que mais rendeu: ${st.plataformaTop}`,
+    ``,
+    `Combustível gasto: ${eur(st.combustivelGasto)} (${num(st.litrosTotais,1)} L)`,
+    tipos,
+    ``,
+    `Lucro após combustível: ${eur(st.lucro)}`,
+    `Combustível = ${num(st.pctCombustivel,0)}% dos ganhos`,
+  ].join('\n');
+}
+
+function downloadText(text, filename){
+  const blob = new Blob([text], {type:'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function shareReport(){
+  const text = buildReportText();
+  if(navigator.share){
+    navigator.share({ title: 'Relatório Estrada', text }).catch(()=>{});
+  } else if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(()=>{
+      alert('Relatório copiado! Agora é só colar onde quiseres enviar (WhatsApp, email, notas...).');
+    }).catch(()=>{ downloadText(text, 'relatorio-estrada.txt'); });
+  } else {
+    downloadText(text, 'relatorio-estrada.txt');
+  }
+}
+
+// ---------- TAB: DADOS ----------
+function renderDados(){
+  const primeira = state.shifts.slice().sort((a,b)=>a.data.localeCompare(b.data))[0];
+  return `
+    <div class="section-title">Cópia de segurança</div>
+    <div class="card">
+      <div class="lr-sub">Guarda uma cópia de todos os teus dados (carros, turnos, abastecimentos) num ficheiro. Serve para restaurar tudo caso troques de telemóvel ou apagues o navegador.</div>
+      <button class="primary" id="btnExportBackup">Descarregar cópia de segurança</button>
+      <hr class="divider-road">
+      <label>Restaurar a partir de um ficheiro</label>
+      <input type="file" id="importFile" accept="application/json">
+      <button class="secondary" id="btnImportBackup">Restaurar dados deste ficheiro</button>
+      <div class="lr-sub" style="margin-top:8px; color:var(--danger);">Atenção: restaurar substitui todos os dados atuais no telemóvel.</div>
+    </div>
+
+    <div class="section-title">Resumo geral</div>
+    <div class="card">
+      <div class="stat-grid">
+        <div class="stat-box"><div class="v">${state.cars.length}</div><div class="l">Carros</div></div>
+        <div class="stat-box"><div class="v">${state.shifts.length}</div><div class="l">Turnos registados</div></div>
+        <div class="stat-box"><div class="v">${state.refuels.length}</div><div class="l">Abastecimentos</div></div>
+        <div class="stat-box"><div class="v" style="font-size:14px;">${primeira ? primeira.data : '—'}</div><div class="l">Primeiro registo</div></div>
+      </div>
+    </div>
+  `;
+}
+
+function exportBackup(){
+  const text = JSON.stringify(state, null, 2);
+  downloadText(text, `estrada-backup-${todayISO()}.json`);
+}
+
+function importBackup(){
+  const input = document.getElementById('importFile');
+  const file = input.files[0];
+  if(!file){ alert('Escolhe primeiro um ficheiro de backup (.json).'); return; }
+  if(!confirm('Isto vai substituir TODOS os dados atuais pelos do ficheiro. Continuar?')) return;
+  const reader = new FileReader();
+  reader.onload = (e)=>{
+    try{
+      const parsed = JSON.parse(e.target.result);
+      if(!Array.isArray(parsed.cars) || !Array.isArray(parsed.shifts) || !Array.isArray(parsed.refuels)){
+        alert('Este ficheiro não parece ser um backup válido do Estrada.'); return;
+      }
+      state = { cars: parsed.cars, shifts: parsed.shifts, refuels: parsed.refuels, active: parsed.active || null };
+      saveState();
+      alert('Dados restaurados com sucesso!');
+      render();
+    }catch(err){
+      alert('Não foi possível ler este ficheiro.');
+    }
+  };
+  reader.readAsText(file);
 }
 
 // ---------- Handlers ----------
@@ -776,8 +1036,64 @@ function attachHandlers(){
     if(confirm('Cancelar o turno atual sem guardar?')){ state.active=null; saveState(); render(); }
   };
   document.querySelectorAll('[data-del-shift]').forEach(el=>{
-    el.onclick = ()=>{ state.shifts = state.shifts.filter(s=>s.id!==el.dataset.delShift); saveState(); render(); };
+    el.onclick = ()=>{
+      if(confirm('Apagar este turno?')){
+        state.shifts = state.shifts.filter(s=>s.id!==el.dataset.delShift); saveState(); render();
+      }
+    };
   });
+  document.querySelectorAll('[data-edit-shift]').forEach(el=>{
+    el.onclick = ()=>{
+      const s = state.shifts.find(x=>x.id===el.dataset.editShift);
+      if(!s) return;
+      manualShiftOpen = true;
+      manualShiftEditId = s.id;
+      manualShiftCarId = s.carId;
+      manualShiftPrefill = { ...s };
+      render();
+      const card = document.querySelector('[data-save-manual]');
+      if(card) card.closest('.card').scrollIntoView({behavior:'smooth', block:'center'});
+    };
+  });
+  const btnOpenManual = document.querySelector('[data-open-manual]');
+  if(btnOpenManual) btnOpenManual.onclick = ()=>{
+    manualShiftOpen = true;
+    manualShiftEditId = null;
+    manualShiftCarId = state.cars[0].id;
+    manualShiftPrefill = null;
+    render();
+  };
+  const btnCancelManual = document.querySelector('[data-cancel-manual]');
+  if(btnCancelManual) btnCancelManual.onclick = ()=>{
+    manualShiftOpen = false; manualShiftEditId = null; manualShiftCarId = null; manualShiftPrefill = null;
+    render();
+  };
+  document.querySelectorAll('[data-pick-car-manual]').forEach(el=>{
+    el.onclick = ()=>{ manualShiftCarId = el.dataset.pickCarManual; render(); };
+  });
+  const btnSaveManual = document.querySelector('[data-save-manual]');
+  if(btnSaveManual) btnSaveManual.onclick = ()=>{
+    const data = document.getElementById('mData').value;
+    const horaInicio = document.getElementById('mHoraInicio').value;
+    const kmInicio = parseFloat(document.getElementById('mKmInicio').value);
+    const horaFim = document.getElementById('mHoraFim').value;
+    const kmFim = parseFloat(document.getElementById('mKmFim').value);
+    const valorUber = parseFloat(document.getElementById('mValorUber').value)||0;
+    const valorGlovo = parseFloat(document.getElementById('mValorGlovo').value)||0;
+    if(!manualShiftCarId || !data || !horaInicio || !horaFim || isNaN(kmInicio) || isNaN(kmFim) || kmFim<kmInicio){
+      alert('Preenche todos os campos corretamente (o km fim tem de ser maior ou igual ao km início).');
+      return;
+    }
+    if(manualShiftEditId){
+      const s = state.shifts.find(x=>x.id===manualShiftEditId);
+      Object.assign(s, { carId: manualShiftCarId, data, horaInicio, kmInicio, horaFim, kmFim, valorUber, valorGlovo });
+    } else {
+      state.shifts.push({ id: uid(), carId: manualShiftCarId, data, horaInicio, kmInicio, horaFim, kmFim, valorUber, valorGlovo });
+    }
+    saveState();
+    manualShiftOpen = false; manualShiftEditId = null; manualShiftCarId = null; manualShiftPrefill = null;
+    render();
+  };
 
   // CARROS
   const btnAddCar = document.getElementById('btnAddCar');
@@ -799,6 +1115,22 @@ function attachHandlers(){
       }
     };
   });
+  document.querySelectorAll('[data-edit-car]').forEach(el=>{
+    el.onclick = ()=>{
+      const car = state.cars.find(c=>c.id===el.dataset.editCar);
+      if(!car) return;
+      const matricula = prompt('Matrícula:', car.matricula);
+      if(matricula===null) return;
+      const apelido = prompt('Apelido (opcional):', car.apelido||'');
+      if(apelido===null) return;
+      let tipo = prompt('Tipo de combustível — gasoleo, gasolina ou gas:', car.tipo);
+      if(tipo===null) return;
+      tipo = tipo.trim().toLowerCase();
+      if(!['gasoleo','gasolina','gas'].includes(tipo)){ alert('Tipo inválido. Usa gasoleo, gasolina ou gas.'); return; }
+      car.matricula = matricula.toUpperCase(); car.apelido = apelido; car.tipo = tipo;
+      saveState(); render();
+    };
+  });
   const btnAddRefuel = document.getElementById('btnAddRefuel');
   if(btnAddRefuel) btnAddRefuel.onclick = ()=>{
     const carId = document.getElementById('refCar').value;
@@ -808,11 +1140,31 @@ function attachHandlers(){
     const valor = parseFloat(document.getElementById('refValor').value);
     if(!carId || isNaN(km) || isNaN(litros) || isNaN(valor)){ alert('Preenche todos os campos do abastecimento.'); return; }
     const car = state.cars.find(c=>c.id===carId);
-    state.refuels.push({ id: uid(), carId, data, km, litros, valor, tipo: car.tipo });
+    if(editingRefuelId){
+      const r = state.refuels.find(x=>x.id===editingRefuelId);
+      Object.assign(r, { carId, data, km, litros, valor, tipo: car.tipo });
+    } else {
+      state.refuels.push({ id: uid(), carId, data, km, litros, valor, tipo: car.tipo });
+    }
+    editingRefuelId = null; refuelPrefill = null;
     saveState(); render();
   };
+  document.querySelectorAll('[data-edit-refuel]').forEach(el=>{
+    el.onclick = ()=>{
+      const r = state.refuels.find(x=>x.id===el.dataset.editRefuel);
+      if(!r) return;
+      editingRefuelId = r.id; refuelPrefill = { ...r };
+      render();
+    };
+  });
+  const btnCancelRefuel = document.getElementById('btnCancelRefuel');
+  if(btnCancelRefuel) btnCancelRefuel.onclick = ()=>{ editingRefuelId=null; refuelPrefill=null; render(); };
   document.querySelectorAll('[data-del-refuel]').forEach(el=>{
-    el.onclick = ()=>{ state.refuels = state.refuels.filter(r=>r.id!==el.dataset.delRefuel); saveState(); render(); };
+    el.onclick = ()=>{
+      if(confirm('Apagar este abastecimento?')){
+        state.refuels = state.refuels.filter(r=>r.id!==el.dataset.delRefuel); saveState(); render();
+      }
+    };
   });
 
   // RELATORIOS
@@ -825,6 +1177,14 @@ function attachHandlers(){
     customTo = document.getElementById('customTo').value;
     render();
   };
+  const btnShareReport = document.getElementById('btnShareReport');
+  if(btnShareReport) btnShareReport.onclick = shareReport;
+
+  // DADOS
+  const btnExportBackup = document.getElementById('btnExportBackup');
+  if(btnExportBackup) btnExportBackup.onclick = exportBackup;
+  const btnImportBackup = document.getElementById('btnImportBackup');
+  if(btnImportBackup) btnImportBackup.onclick = importBackup;
 }
 
 render();
