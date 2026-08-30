@@ -376,6 +376,9 @@ function nowHHMM(){ const d=new Date(); return String(d.getHours()).padStart(2,'
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 function eur(v){ return (Math.round((v||0)*100)/100).toFixed(2).replace('.', ',') + ' €'; }
 function num(v,d=1){ return (Math.round((v||0)*Math.pow(10,d))/Math.pow(10,d)).toFixed(d); }
+// Taxas por km (€/km) precisam de mais casas decimais do que valores em dinheiro —
+// senão "0,11 €/km × 60 km" não bate certo com o total calculado com precisão total.
+function eurRate(v){ return (Math.round((v||0)*10000)/10000).toFixed(4).replace('.', ',') + ' €'; }
 
 function loadState(){
   try{
@@ -444,7 +447,7 @@ function renderFuelEstimateBlock(carId, estId){
   }
   return `
     <div class="odometer" style="margin-top:14px;">
-      <div class="odo-cell"><div class="odo-val" style="font-size:15px;">${eur(stats.custoPorKm)}</div><div class="odo-label">custo médio / km</div></div>
+      <div class="odo-cell"><div class="odo-val" style="font-size:15px;">${eurRate(stats.custoPorKm)}</div><div class="odo-label">custo médio / km</div></div>
       <div class="odo-cell"><div class="odo-val" style="font-size:15px;">${num(stats.consumoL100,1)} L</div><div class="odo-label">consumo / 100km</div></div>
     </div>
     <div class="lr-sub" style="margin-top:8px;">Baseado no último abastecimento (${stats.dataUltimo}) — ${num(stats.dKm,0)} km percorridos desde o abastecimento anterior${stats.precoPorLitro?', a '+eur(stats.precoPorLitro)+'/L':''}.</div>
@@ -670,7 +673,7 @@ function renderAllShifts(){
     const fstats = statsCache[s.carId];
     const combustivel = fstats ? km*fstats.custoPorKm : null;
     const liquidoTurno = combustivel!=null ? bruto - combustivel : null;
-    const combustivelInfo = combustivel!=null ? `· combustível ~${eur(combustivel)} (info.)` : '';
+    const combustivelInfo = combustivel!=null ? `· combustível ${eurRate(fstats.custoPorKm)}/km × ${km}km = ${eur(combustivel)} (info.)` : '';
     return `
       <div class="list-row">
         <div>
@@ -793,14 +796,36 @@ function computeStats(from, to){
   const pctCombustivel = ganhoTotal>0 ? (combustivelGasto/ganhoTotal*100) : 0;
   const eurPorKm = kmTotais>0 ? ganhoTotal/kmTotais : 0;
   const eurPorHora = horasTotais>0 ? ganhoTotal/horasTotais : 0;
-  const custoCombustivelPorKm = kmTotais>0 ? combustivelGasto/kmTotais : 0;
+
+  // Custo médio de combustível/km: usa a taxa REAL de consumo de cada carro
+  // (litros e valor pagos entre abastecimentos), aplicada aos km que esse carro
+  // fez no período — nunca a divisão direta "gasto do período ÷ km do período",
+  // que dá valores errados sempre que o abastecimento não coincide exatamente
+  // com o período escolhido (ex: abasteceste esta semana mas o depósito também
+  // serve para a semana seguinte).
+  let kmComTaxaConhecida = 0, custoEstimadoTotal = 0;
+  state.cars.forEach(c=>{
+    const cKm = shifts.filter(s=>s.carId===c.id).reduce((a,s)=>a+(s.kmFim-s.kmInicio),0);
+    if(cKm<=0) return;
+    const cstats = computeCarFuelStats(c.id);
+    if(!cstats) return;
+    kmComTaxaConhecida += cKm;
+    custoEstimadoTotal += cKm * cstats.custoPorKm;
+  });
+  const custoCombustivelPorKm = kmComTaxaConhecida>0 ? custoEstimadoTotal/kmComTaxaConhecida : 0;
+  // custoEstimadoTotal já é "0,11 €/km × km do período" somado por carro — é o que aparece
+  // como combustível estimado nos turnos. Mostra-se separado do "gasto total" (dinheiro
+  // realmente pago em abastecimentos), porque um abastecimento cheio cobre muito mais km
+  // do que só os do período escolhido.
+  const combustivelEstimadoPeriodo = custoEstimadoTotal;
+  const diferencaGastoVsEstimado = combustivelGasto - combustivelEstimadoPeriodo;
 
   const plataformaTop = uberLiquido===glovoLiquido ? 'Empate' : (uberLiquido>glovoLiquido ? 'Uber Eats' : 'Glovo');
 
   const carStats = state.cars.map(c=>{
     const cShifts = shifts.filter(s=>s.carId===c.id);
     const cRef = refuels.filter(r=>r.carId===c.id);
-    const cGanho = cShifts.reduce((a,s)=>a+(s.valorUber*0.9)+s.valorGlovo,0);
+    const cGanho = cShifts.reduce((a,s)=>a+s.valorUber+s.valorGlovo,0); // bruto — igual ao mostrado no Turno
     const cKm = cShifts.reduce((a,s)=>a+(s.kmFim-s.kmInicio),0);
     const cGasto = cRef.reduce((a,r)=>a+r.valor,0);
     return { car:c, ganho:cGanho, km:cKm, gasto:cGasto, turnos:cShifts.length };
@@ -808,7 +833,8 @@ function computeStats(from, to){
 
   return { nTurnos, horasTotais, kmTotais, uberBruto, glovoBruto, uberLiquido, glovoLiquido,
     ganhoTotal, horasMedias, kmMedios, litrosTotais, combustivelGasto, porTipo, lucro,
-    pctCombustivel, eurPorKm, eurPorHora, custoCombustivelPorKm, plataformaTop, carStats };
+    pctCombustivel, eurPorKm, eurPorHora, custoCombustivelPorKm, combustivelEstimadoPeriodo,
+    diferencaGastoVsEstimado, plataformaTop, carStats };
 }
 
 function renderRelatorios(){
@@ -816,7 +842,8 @@ function renderRelatorios(){
   const st = computeStats(from, to);
   const { nTurnos, horasTotais, kmTotais, uberLiquido, glovoLiquido, ganhoTotal, horasMedias,
     kmMedios, litrosTotais, combustivelGasto, porTipo, lucro, pctCombustivel, eurPorHora,
-    custoCombustivelPorKm, plataformaTop, carStats } = st;
+    custoCombustivelPorKm, combustivelEstimadoPeriodo, diferencaGastoVsEstimado,
+    plataformaTop, carStats } = st;
   const maxLiquido = Math.max(uberLiquido, glovoLiquido, 1);
 
   let verdictClass='good', verdictText='';
@@ -883,15 +910,25 @@ function renderRelatorios(){
 
     <div class="section-title">Combustível <span style="text-transform:none; letter-spacing:0; color:var(--chalk-faint);">(informativo — não é descontado do ganho)</span></div>
     <div class="card">
+      <div class="lr-sub" style="margin-bottom:10px;">Dinheiro realmente pago em abastecimentos neste período:</div>
       <div class="stat-grid">
-        <div class="stat-box amber"><div class="v">${eur(combustivelGasto)}</div><div class="l">Gasto total</div></div>
+        <div class="stat-box amber"><div class="v">${eur(combustivelGasto)}</div><div class="l">Gasto total (real)</div></div>
         <div class="stat-box"><div class="v">${num(litrosTotais,1)} L</div><div class="l">Litros totais</div></div>
-        <div class="stat-box amber"><div class="v">${eur(custoCombustivelPorKm)}</div><div class="l">Custo médio / km</div></div>
-        <div class="stat-box"><div class="v">${num(kmTotais,0)}</div><div class="l">Km no período</div></div>
       </div>
       ${Object.keys(porTipo).length ? `<div style="margin-top:14px;">${Object.entries(porTipo).map(([t,v])=>`
         <div class="list-row"><div class="lr-main">${FUEL_LABEL[t]}</div><div class="lr-val">${eur(v)}</div></div>
       `).join('')}</div>` : ''}
+
+      <hr class="divider-road" style="margin:18px 0;">
+
+      <div class="lr-sub" style="margin-bottom:10px;">Estimativa de combustível para os km que rodaste neste período (custo médio/km × km do período):</div>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="v" style="font-size:16px;">${eurRate(custoCombustivelPorKm)}</div><div class="l">Custo médio / km</div></div>
+        <div class="stat-box"><div class="v">${num(kmTotais,0)}</div><div class="l">Km no período</div></div>
+        <div class="stat-box teal"><div class="v">${eur(combustivelEstimadoPeriodo)}</div><div class="l">Combustível estimado p/ estes km</div></div>
+        <div class="stat-box ${diferencaGastoVsEstimado>=0?'':'lo'}"><div class="v">${eur(diferencaGastoVsEstimado)}</div><div class="l">Diferença (real − estimado)</div></div>
+      </div>
+      <div class="lr-sub" style="margin-top:10px;">Cálculo: ${eurRate(custoCombustivelPorKm)}/km × ${num(kmTotais,0)} km = ${eur(combustivelEstimadoPeriodo)}. A "diferença" mostra quanto o gasto real ficou acima (ou abaixo) do que seria só para estes km — normal se o depósito também serve para km fora deste período.</div>
     </div>
 
     ${carStats.length ? `
@@ -968,6 +1005,8 @@ function buildReportText(){
     ``,
     `Combustível gasto: ${eur(st.combustivelGasto)} (${num(st.litrosTotais,1)} L)`,
     `Custo médio de combustível / km: ${eur(st.custoCombustivelPorKm)}`,
+    `Combustível estimado p/ km do período: ${eur(st.combustivelEstimadoPeriodo)}`,
+    `Diferença (gasto real - estimado): ${eur(st.diferencaGastoVsEstimado)}`,
     tipos,
     ``,
     `Lucro após combustível: ${eur(st.lucro)}`,
