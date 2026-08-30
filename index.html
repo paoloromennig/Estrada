@@ -276,7 +276,7 @@
     display:flex; flex-direction:column; align-items:center; gap:4px;
     background:none; border:none; color:var(--chalk-faint);
     padding:6px 0; cursor:pointer; font-family:var(--font-ui);
-    font-size:10.5px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+    font-size:9.5px; font-weight:700; letter-spacing:.2px; text-transform:uppercase;
   }
   .tab svg{ width:20px; height:20px; }
   .tab.active{ color:var(--line-amber); }
@@ -349,6 +349,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>
       Relatórios
     </button>
+    <button class="tab" data-tab="pagamentos">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M15 8.5a3.3 3.3 0 00-2.8-1.4c-1.9 0-3.2 1.3-3.2 4.9s1.3 4.9 3.2 4.9a3.3 3.3 0 002.8-1.4M7.5 10h5.5M7.5 14h4.5"/></svg>
+      Pagamentos
+    </button>
     <button class="tab" data-tab="dados">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16"/></svg>
       Dados
@@ -399,6 +403,14 @@ let manualShiftPrefill = null;
 let editingRefuelId = null;
 let refuelPrefill = null;
 
+// pagamentos por plataforma
+let pagUberPeriod = 'semana'; // semana | semana_passada | custom
+let pagUberFrom = null, pagUberTo = null;
+let pagGlovoYearMonth = null; // "YYYY-MM"
+let pagGlovoQuinzena = 1; // 1 ou 2
+let pagGlovoCustom = false;
+let pagGlovoFrom = null, pagGlovoTo = null;
+
 function getLastKmForCar(carId, excludeShiftId){
   const list = state.shifts
     .filter(s => s.carId===carId && s.id!==excludeShiftId)
@@ -406,25 +418,22 @@ function getLastKmForCar(carId, excludeShiftId){
   return list.length ? list[list.length-1].kmFim : null;
 }
 
-// Calcula custo médio (€/km) e consumo médio (L/100km) de um carro,
-// a partir do histórico de abastecimentos (ordenados por km, método "cheio a cheio").
+// Calcula custo/km e consumo com base no ÚLTIMO abastecimento: usa os km percorridos
+// desde o abastecimento anterior e o preço pago nesse último abastecimento.
+// É só uma estimativa informativa — nunca é descontada de nenhum ganho.
 function computeCarFuelStats(carId){
   const list = state.refuels.filter(r=>r.carId===carId).sort((a,b)=>a.km-b.km);
   if(list.length < 2) return null;
-  let totalKm=0, totalLitros=0, totalValor=0;
-  for(let i=1;i<list.length;i++){
-    const dKm = list[i].km - list[i-1].km;
-    if(dKm <= 0) continue; // ignora km inconsistentes (ex: abastecimentos fora de ordem)
-    totalKm += dKm;
-    totalLitros += list[i].litros;
-    totalValor += list[i].valor;
-  }
-  if(totalKm <= 0) return null;
+  const prev = list[list.length-2];
+  const last = list[list.length-1];
+  const dKm = last.km - prev.km;
+  if(dKm <= 0) return null;
   return {
-    custoPorKm: totalValor/totalKm,
-    consumoL100: (totalLitros/totalKm)*100,
-    kmCobertos: totalKm,
-    amostras: list.length-1
+    custoPorKm: last.valor/dKm,
+    consumoL100: (last.litros/dKm)*100,
+    precoPorLitro: last.litros>0 ? last.valor/last.litros : null,
+    dKm,
+    dataUltimo: last.data
   };
 }
 
@@ -438,10 +447,10 @@ function renderFuelEstimateBlock(carId, estId){
       <div class="odo-cell"><div class="odo-val" style="font-size:15px;">${eur(stats.custoPorKm)}</div><div class="odo-label">custo médio / km</div></div>
       <div class="odo-cell"><div class="odo-val" style="font-size:15px;">${num(stats.consumoL100,1)} L</div><div class="odo-label">consumo / 100km</div></div>
     </div>
-    <div class="lr-sub" style="margin-top:8px;">Baseado em ${stats.amostras} abastecimento(s) e ${num(stats.kmCobertos,0)} km deste carro.</div>
+    <div class="lr-sub" style="margin-top:8px;">Baseado no último abastecimento (${stats.dataUltimo}) — ${num(stats.dKm,0)} km percorridos desde o abastecimento anterior${stats.precoPorLitro?', a '+eur(stats.precoPorLitro)+'/L':''}.</div>
     <div class="live" style="margin-top:12px; background:rgba(242,169,59,0.08); border-color:var(--line-amber-dim);">
       <div class="live-dot" style="background:var(--line-amber);"></div>
-      <div class="live-text" style="color:var(--line-amber);">COMBUSTÍVEL ESTIMADO NESTE TURNO</div>
+      <div class="live-text" style="color:var(--line-amber);">COMBUSTÍVEL ESTIMADO NESTE TURNO (informativo)</div>
       <div class="live-time" id="${estId}" style="color:var(--line-amber);">—</div>
     </div>
   `;
@@ -499,6 +508,7 @@ function render(){
   if(activeTab==='turno') main.innerHTML = renderTurno();
   else if(activeTab==='carros') main.innerHTML = renderCarros();
   else if(activeTab==='relatorios') main.innerHTML = renderRelatorios();
+  else if(activeTab==='pagamentos') main.innerHTML = renderPagamentos();
   else main.innerHTML = renderDados();
 
   const chip = document.getElementById('activeCarChip');
@@ -649,18 +659,27 @@ function renderManualShiftForm(){
 function renderAllShifts(){
   const list = state.shifts.slice().sort((a,b)=> (b.data+b.horaInicio).localeCompare(a.data+a.horaInicio));
   if(list.length===0) return `<div class="section-title">Turnos</div><div class="empty">Ainda não há turnos registados.</div>`;
+  const statsCache = {};
   const rows = list.map(s=>{
     const car = state.cars.find(c=>c.id===s.carId);
     const km = s.kmFim - s.kmInicio;
-    const total = (s.valorUber*0.9) + s.valorGlovo;
+    // Bruto do turno: soma real do que ganhaste (o desconto de 10% da Uber é SEMANAL,
+    // aplicado só nos Relatórios/Pagamentos — nunca aqui, turno a turno).
+    const bruto = s.valorUber + s.valorGlovo;
+    if(!(s.carId in statsCache)) statsCache[s.carId] = computeCarFuelStats(s.carId);
+    const fstats = statsCache[s.carId];
+    const combustivel = fstats ? km*fstats.custoPorKm : null;
+    const liquidoTurno = combustivel!=null ? bruto - combustivel : null;
+    const combustivelInfo = combustivel!=null ? `· combustível ~${eur(combustivel)} (info.)` : '';
     return `
       <div class="list-row">
         <div>
           <div class="lr-main">${s.data} · ${s.horaInicio}–${s.horaFim} · ${car?(car.apelido||car.matricula):'?'}</div>
-          <div class="lr-sub">${km} km · Uber ${eur(s.valorUber)} · Glovo ${eur(s.valorGlovo)}</div>
+          <div class="lr-sub">${km} km · Uber ${eur(s.valorUber)} · Glovo ${eur(s.valorGlovo)} ${combustivelInfo}</div>
         </div>
         <div style="text-align:right;">
-          <div class="lr-val">${eur(total)}</div>
+          <div class="lr-val">${eur(bruto)}</div>
+          ${liquidoTurno!=null ? `<div class="lr-sub" style="color:var(--good); margin-top:2px;">líquido: ${eur(liquidoTurno)}</div>` : ''}
           <div class="lr-actions">
             <button class="ghost-sm" data-edit-shift="${s.id}">editar</button>
             <button class="ghost-sm danger" data-del-shift="${s.id}">apagar</button>
@@ -670,6 +689,7 @@ function renderAllShifts(){
   }).join('');
   return `
     <div class="section-title">Todos os turnos (${list.length})</div>
+    <div class="lr-sub" style="margin-bottom:8px;">Valor à direita = ganho bruto do turno (Uber + Glovo, sem descontos). "líquido" = bruto menos combustível estimado, só para tua informação. O desconto de 10% da Uber só é aplicado na semana, nos Relatórios/Pagamentos.</div>
     <div class="card">${rows}</div>
   `;
 }
@@ -773,6 +793,7 @@ function computeStats(from, to){
   const pctCombustivel = ganhoTotal>0 ? (combustivelGasto/ganhoTotal*100) : 0;
   const eurPorKm = kmTotais>0 ? ganhoTotal/kmTotais : 0;
   const eurPorHora = horasTotais>0 ? ganhoTotal/horasTotais : 0;
+  const custoCombustivelPorKm = kmTotais>0 ? combustivelGasto/kmTotais : 0;
 
   const plataformaTop = uberLiquido===glovoLiquido ? 'Empate' : (uberLiquido>glovoLiquido ? 'Uber Eats' : 'Glovo');
 
@@ -787,7 +808,7 @@ function computeStats(from, to){
 
   return { nTurnos, horasTotais, kmTotais, uberBruto, glovoBruto, uberLiquido, glovoLiquido,
     ganhoTotal, horasMedias, kmMedios, litrosTotais, combustivelGasto, porTipo, lucro,
-    pctCombustivel, eurPorKm, eurPorHora, plataformaTop, carStats };
+    pctCombustivel, eurPorKm, eurPorHora, custoCombustivelPorKm, plataformaTop, carStats };
 }
 
 function renderRelatorios(){
@@ -795,7 +816,7 @@ function renderRelatorios(){
   const st = computeStats(from, to);
   const { nTurnos, horasTotais, kmTotais, uberLiquido, glovoLiquido, ganhoTotal, horasMedias,
     kmMedios, litrosTotais, combustivelGasto, porTipo, lucro, pctCombustivel, eurPorHora,
-    plataformaTop, carStats } = st;
+    custoCombustivelPorKm, plataformaTop, carStats } = st;
   const maxLiquido = Math.max(uberLiquido, glovoLiquido, 1);
 
   let verdictClass='good', verdictText='';
@@ -860,11 +881,13 @@ function renderRelatorios(){
       <div class="lr-sub" style="margin-top:12px;">Plataforma que mais rendeu: <strong style="color:var(--chalk);">${plataformaTop}</strong></div>
     </div>
 
-    <div class="section-title">Combustível</div>
+    <div class="section-title">Combustível <span style="text-transform:none; letter-spacing:0; color:var(--chalk-faint);">(informativo — não é descontado do ganho)</span></div>
     <div class="card">
       <div class="stat-grid">
         <div class="stat-box amber"><div class="v">${eur(combustivelGasto)}</div><div class="l">Gasto total</div></div>
         <div class="stat-box"><div class="v">${num(litrosTotais,1)} L</div><div class="l">Litros totais</div></div>
+        <div class="stat-box amber"><div class="v">${eur(custoCombustivelPorKm)}</div><div class="l">Custo médio / km</div></div>
+        <div class="stat-box"><div class="v">${num(kmTotais,0)}</div><div class="l">Km no período</div></div>
       </div>
       ${Object.keys(porTipo).length ? `<div style="margin-top:14px;">${Object.entries(porTipo).map(([t,v])=>`
         <div class="list-row"><div class="lr-main">${FUEL_LABEL[t]}</div><div class="lr-val">${eur(v)}</div></div>
@@ -878,16 +901,47 @@ function renderRelatorios(){
         <div class="list-row">
           <div>
             <div class="lr-main">${cs.car.apelido||cs.car.matricula}</div>
-            <div class="lr-sub">${cs.turnos} turno(s) · ${num(cs.km,0)} km · gasto ${eur(cs.gasto)}</div>
+            <div class="lr-sub">${cs.turnos} turno(s) · ${num(cs.km,0)} km · combustível ${eur(cs.gasto)}</div>
           </div>
-          <div class="lr-val">${eur(cs.ganho-cs.gasto)}</div>
+          <div class="lr-val">${eur(cs.ganho)}</div>
         </div>
       `).join('')}
+      <div class="lr-sub" style="margin-top:10px;">O valor à direita é o ganho de cada carro. O combustível aparece só como informação — não é descontado daqui.</div>
     </div>` : ''}
+
+    ${renderPerDayBreakdown(from, to)}
 
     <div class="verdict ${verdictClass}">${verdictText}</div>
 
     <button class="secondary" id="btnShareReport">Partilhar / enviar este relatório</button>
+  `;
+}
+
+function renderPerDayBreakdown(from, to){
+  const shifts = state.shifts.filter(s=>inRange(s.data, from, to));
+  const refuels = state.refuels.filter(r=>inRange(r.data, from, to));
+  const map = {};
+  shifts.forEach(s=>{
+    if(!map[s.data]) map[s.data] = { ganho:0, gasto:0 };
+    map[s.data].ganho += (s.valorUber*0.9) + s.valorGlovo;
+  });
+  refuels.forEach(r=>{
+    if(!map[r.data]) map[r.data] = { ganho:0, gasto:0 };
+    map[r.data].gasto += r.valor;
+  });
+  const dates = Object.keys(map).sort().reverse();
+  if(dates.length===0) return '';
+  const rows = dates.map(d=>`
+    <div class="list-row">
+      <div><div class="lr-main">${d}</div><div class="lr-sub">Combustível: ${eur(map[d].gasto)}</div></div>
+      <div class="lr-val">${eur(map[d].ganho)}</div>
+    </div>
+  `).join('');
+  return `
+    <div class="section-title">Por dia</div>
+    <div class="card">${rows}
+      <div class="lr-sub" style="margin-top:10px;">Ganho líquido (Uber −10% + Glovo) por dia. O combustível é informativo, não é descontado deste valor.</div>
+    </div>
   `;
 }
 
@@ -913,6 +967,7 @@ function buildReportText(){
     `Plataforma que mais rendeu: ${st.plataformaTop}`,
     ``,
     `Combustível gasto: ${eur(st.combustivelGasto)} (${num(st.litrosTotais,1)} L)`,
+    `Custo médio de combustível / km: ${eur(st.custoCombustivelPorKm)}`,
     tipos,
     ``,
     `Lucro após combustível: ${eur(st.lucro)}`,
@@ -941,6 +996,107 @@ function shareReport(){
     downloadText(text, 'relatorio-estrada.txt');
   }
 }
+
+// ---------- TAB: PAGAMENTOS ----------
+function currentYearMonth(){
+  const d = new Date();
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+}
+function getQuinzenaRange(yearMonthStr, quinzena){
+  const [y,m] = yearMonthStr.split('-').map(Number);
+  if(quinzena===1) return [new Date(y, m-1, 1), new Date(y, m-1, 15)];
+  const last = new Date(y, m, 0).getDate();
+  return [new Date(y, m-1, 16), new Date(y, m-1, last)];
+}
+
+function renderPagamentos(){
+  if(!pagGlovoYearMonth) pagGlovoYearMonth = currentYearMonth();
+
+  // --- Uber (semanal, -10%) ---
+  let uberFrom, uberTo;
+  if(pagUberPeriod==='semana'){ uberFrom = startOfWeek(new Date()); uberTo = endOfWeek(new Date()); }
+  else if(pagUberPeriod==='semana_passada'){ uberFrom = startOfWeek(new Date()); uberFrom.setDate(uberFrom.getDate()-7); uberTo = new Date(uberFrom); uberTo.setDate(uberTo.getDate()+6); }
+  else { uberFrom = parseDate(pagUberFrom||todayISO()); uberTo = parseDate(pagUberTo||todayISO()); }
+
+  const uberShifts = state.shifts.filter(s=>inRange(s.data, uberFrom, uberTo));
+  const uberBruto = uberShifts.reduce((a,s)=>a+s.valorUber,0);
+  const uberDesconto = uberBruto*0.10;
+  const uberAReceber = uberBruto - uberDesconto;
+
+  // --- Glovo (quinzenal, integral) ---
+  const [gFrom, gTo] = pagGlovoCustom
+    ? [parseDate(pagGlovoFrom||todayISO()), parseDate(pagGlovoTo||todayISO())]
+    : getQuinzenaRange(pagGlovoYearMonth, pagGlovoQuinzena);
+
+  const glovoShifts = state.shifts.filter(s=>inRange(s.data, gFrom, gTo));
+  const glovoAReceber = glovoShifts.reduce((a,s)=>a+s.valorGlovo,0);
+
+  const totalGlobal = uberAReceber + glovoAReceber;
+
+  return `
+    <div class="section-title">Uber Eats · pagamento semanal</div>
+    <div class="card">
+      <div class="period-row" style="margin-bottom:14px;">
+        <button class="period-btn ${pagUberPeriod==='semana'?'sel':''}" data-uber-period="semana">Esta semana</button>
+        <button class="period-btn ${pagUberPeriod==='semana_passada'?'sel':''}" data-uber-period="semana_passada">Semana passada</button>
+        <button class="period-btn ${pagUberPeriod==='custom'?'sel':''}" data-uber-period="custom">Personalizada</button>
+      </div>
+      ${pagUberPeriod==='custom' ? `
+        <div class="row2">
+          <div><label>De</label><input type="date" id="uberFrom" value="${pagUberFrom||todayISO()}"></div>
+          <div><label>Até</label><input type="date" id="uberTo" value="${pagUberTo||todayISO()}"></div>
+        </div>
+        <button class="secondary" id="btnApplyUber">Aplicar</button>
+      ` : ''}
+      <div class="lr-sub" style="margin-top:10px;">${toISO(uberFrom)} a ${toISO(uberTo)}</div>
+      <div class="stat-grid" style="margin-top:10px;">
+        <div class="stat-box"><div class="v">${eur(uberBruto)}</div><div class="l">Ganho bruto</div></div>
+        <div class="stat-box lo"><div class="v">−${eur(uberDesconto)}</div><div class="l">Desconto plataforma (10%)</div></div>
+      </div>
+      <div class="live" style="margin-top:12px; background:rgba(43,179,163,0.1); border-color:var(--signal-teal-dim);">
+        <div class="live-dot" style="background:var(--signal-teal);"></div>
+        <div class="live-text" style="color:var(--signal-teal);">A RECEBER DA UBER</div>
+        <div class="live-time" style="color:var(--signal-teal); font-size:18px;">${eur(uberAReceber)}</div>
+      </div>
+    </div>
+
+    <div class="section-title">Glovo · pagamento quinzenal</div>
+    <div class="card">
+      <div class="row2">
+        <div><label>Mês</label><input type="month" id="glovoMonth" value="${pagGlovoYearMonth}"></div>
+        <div><label>Quinzena</label>
+          <div class="chips" style="margin-top:0;">
+            <div class="chip-btn ${!pagGlovoCustom && pagGlovoQuinzena===1?'sel':''}" data-glovo-q="1">1ª<span class="sub">dias 1–15</span></div>
+            <div class="chip-btn ${!pagGlovoCustom && pagGlovoQuinzena===2?'sel':''}" data-glovo-q="2">2ª<span class="sub">dia 16–fim</span></div>
+          </div>
+        </div>
+      </div>
+      <button class="secondary" data-glovo-custom-toggle="1" style="margin-top:10px;">${pagGlovoCustom ? 'Usar quinzena do mês' : 'Usar datas personalizadas'}</button>
+      ${pagGlovoCustom ? `
+        <div class="row2" style="margin-top:10px;">
+          <div><label>De</label><input type="date" id="glovoFrom" value="${pagGlovoFrom||todayISO()}"></div>
+          <div><label>Até</label><input type="date" id="glovoTo" value="${pagGlovoTo||todayISO()}"></div>
+        </div>
+        <button class="secondary" id="btnApplyGlovo">Aplicar</button>
+      ` : ''}
+      <div class="lr-sub" style="margin-top:10px;">${toISO(gFrom)} a ${toISO(gTo)}</div>
+      <div class="live" style="margin-top:12px; background:rgba(242,169,59,0.1); border-color:var(--line-amber-dim);">
+        <div class="live-dot" style="background:var(--line-amber);"></div>
+        <div class="live-text" style="color:var(--line-amber);">A RECEBER DA GLOVO (integral)</div>
+        <div class="live-time" style="color:var(--line-amber); font-size:18px;">${eur(glovoAReceber)}</div>
+      </div>
+    </div>
+
+    <div class="section-title">Total combinado</div>
+    <div class="card">
+      <div class="lr-sub">Soma dos dois períodos selecionados acima (podem não coincidir nas mesmas datas — é normal, Uber é semanal e Glovo é quinzenal).</div>
+      <div class="stat-grid" style="margin-top:10px;">
+        <div class="stat-box hi"><div class="v" style="font-size:22px;">${eur(totalGlobal)}</div><div class="l">Total a receber</div></div>
+      </div>
+    </div>
+  `;
+}
+
 
 // ---------- TAB: DADOS ----------
 function renderDados(){
@@ -1179,6 +1335,30 @@ function attachHandlers(){
   };
   const btnShareReport = document.getElementById('btnShareReport');
   if(btnShareReport) btnShareReport.onclick = shareReport;
+
+  // PAGAMENTOS
+  document.querySelectorAll('[data-uber-period]').forEach(el=>{
+    el.onclick = ()=>{ pagUberPeriod = el.dataset.uberPeriod; render(); };
+  });
+  const btnApplyUber = document.getElementById('btnApplyUber');
+  if(btnApplyUber) btnApplyUber.onclick = ()=>{
+    pagUberFrom = document.getElementById('uberFrom').value;
+    pagUberTo = document.getElementById('uberTo').value;
+    render();
+  };
+  const glovoMonthEl = document.getElementById('glovoMonth');
+  if(glovoMonthEl) glovoMonthEl.onchange = ()=>{ pagGlovoYearMonth = glovoMonthEl.value; render(); };
+  document.querySelectorAll('[data-glovo-q]').forEach(el=>{
+    el.onclick = ()=>{ pagGlovoQuinzena = parseInt(el.dataset.glovoQ,10); pagGlovoCustom = false; render(); };
+  });
+  const btnGlovoCustomToggle = document.querySelector('[data-glovo-custom-toggle]');
+  if(btnGlovoCustomToggle) btnGlovoCustomToggle.onclick = ()=>{ pagGlovoCustom = !pagGlovoCustom; render(); };
+  const btnApplyGlovo = document.getElementById('btnApplyGlovo');
+  if(btnApplyGlovo) btnApplyGlovo.onclick = ()=>{
+    pagGlovoFrom = document.getElementById('glovoFrom').value;
+    pagGlovoTo = document.getElementById('glovoTo').value;
+    render();
+  };
 
   // DADOS
   const btnExportBackup = document.getElementById('btnExportBackup');
